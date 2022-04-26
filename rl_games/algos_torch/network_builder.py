@@ -583,6 +583,13 @@ class RelationalA2CBuilder(NetworkBuilder):
                 obj_emb_input_shape = params['rn']['rel_mlp']['units'][-1]
                 mlp_input_shape = robot_input_shape + obj_emb_input_shape
 
+                if self.verbose:
+                    print("Creating Relational Network module ..")
+                    print("emb_mlp:", self.emb_mlp)
+                    print("rel_mlp:", self.rel_mlp)
+                    print("robot_input_shape:", robot_input_shape)
+                    print("obj_emb_input_shape:", obj_emb_input_shape)
+
             if self.has_gnn:
                 print("in has graph neural network")
                 assert False
@@ -787,6 +794,13 @@ class RelationalA2CBuilder(NetworkBuilder):
 
                 if self.has_rn:
                     obj_set, robot_obs = self.split_set_obs(obs)
+                    if self.verbose:
+                        print("forward with RN called ...")
+                        print("obj_set.shape:", obj_set.shape)
+                        print("robot_obs.shape:", robot_obs.shape)
+                        print("obj_set[0]:", obj_set[0])
+                        import time
+                        time.sleep(2)
                     obj_emb = self.get_rn_emb(obj_set)
                     out = torch.cat([obj_emb, robot_obs], dim=1)
 
@@ -873,10 +887,8 @@ class RelationalA2CBuilder(NetworkBuilder):
                     torch.zeros((num_layers, self.num_seqs, rnn_units)),)
 
         def split_set_obs(self, obs):
-            obj_set = obs[:,
-                      self.set_start_idx:self.object_state_size * self.num_objects]
-            robot_obs = obs[:,
-                        self.set_start_idx + self.object_state_size * self.num_objects:]
+            obj_set = obs[:, 0:self.object_state_size * self.num_objects]
+            robot_obs = obs[:, self.object_state_size * self.num_objects:]
             obj_set = obj_set.view(obs.shape[0], self.num_objects,
                                    self.object_state_size)
             return obj_set, robot_obs
@@ -893,11 +905,17 @@ class RelationalA2CBuilder(NetworkBuilder):
                                  -1)  # (num_envs, num_obj ** 2, 2 * token_size)
             relations = self.rel_mlp(o_pair)
             out = relations.sum(1)  # (num_envs, emb_size)
+
+            if self.verbose:
+                print("obj_tokens.shape:", obj_tokens.shape)
+                print("o_pair.shape:", o_pair.shape)
+                print("relations.shape:", relations.shape)
+                print("out.shape:", out.shape)
             return self.rn_layer_norm(out)
 
         def load(self, params):
-
             self.separate = params.get('separate', False)
+            self.verbose = params.get('verbose', False)
             self.units = params['mlp']['units']
             self.activation = params['mlp']['activation']
             self.initializer = params['mlp']['initializer']
@@ -907,7 +925,7 @@ class RelationalA2CBuilder(NetworkBuilder):
             self.value_activation = params.get('value_activation', 'None')
             self.normalization = params.get('normalization', None)
             self.has_rnn = 'rnn' in params
-            self.has_rn = 'rn' in params
+            self.has_rn = 'rn' in params and params['rn']['use_rn']
             self.has_gnn = 'gnn' in params
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
@@ -939,9 +957,9 @@ class RelationalA2CBuilder(NetworkBuilder):
                 self.rnn_concat_input = params['rnn'].get('concat_input', False)
 
             if self.has_rn:
-                self.object_state_size = params['rn']['object_state_size']
+                self.object_state_size = self._infer_object_state_size(
+                    params['rn'])
                 self.num_objects = params['rn']['num_objects']
-                self.set_start_idx = params['rn']['set_start_idx']
 
             if 'cnn' in params:
                 self.has_cnn = True
@@ -950,9 +968,18 @@ class RelationalA2CBuilder(NetworkBuilder):
             else:
                 self.has_cnn = False
 
+        def _infer_object_state_size(self, rn_params) -> int:
+            object_state_size = 0
+            for obs in rn_params['observations']:
+                if obs.startswith('object'):
+                    object_state_size += rn_params['obs_size'][obs]
+            return object_state_size
+
     def build(self, name, **kwargs):
         net = RelationalA2CBuilder.Network(self.params, **kwargs)
         return net
+
+
 
 
 class Conv2dAuto(nn.Conv2d):
