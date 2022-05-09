@@ -912,55 +912,40 @@ class RelationalA2CBuilder(NetworkBuilder):
             return self.rn_layer_norm(out)
 
         def get_arn_emb(self, obj_set):
-            # Get adjacency matrix
+            obj_tokens = self.emb_mlp(
+                obj_set)  # (num_envs, num_obj, token_size)
+            num_envs = obj_tokens.shape[0]
+            token_size = obj_tokens.shape[2]
+
+            # get pair-wise relations to k closest objects
             obj_pos = obj_set[..., 0:3]  # (num_envs, num_obj, 3)
             obj_pos_i = obj_pos.unsqueeze(1).repeat(1, self.num_objects, 1, 1)
             obj_pos_j = obj_pos.unsqueeze(2).repeat(1, 1, self.num_objects, 1)
             obj_dist = torch.norm(obj_pos_i - obj_pos_j, dim=3)
+            min_dist, min_dist_idxs = torch.topk(
+                obj_dist, self.num_relations + 1, dim=2, largest=False)
+            # remove distance from object to itself
+            min_dist, min_dist_idxs = min_dist[..., 1:], min_dist_idxs[..., 1:]
 
-            print("obj_dist.shape:", obj_dist.shape)
-            print("obj_dist[0]:", obj_dist[0])
-            min_dist, idxs = torch.topk(obj_dist, self.num_relations + 1, dim=2,
-                                        largest=False)
-            min_dist, idxs = min_dist[..., 1:], idxs[..., 1:]  # remove distance from object to itself
-            print("min_dist:", min_dist)
-            print("idxs[0]:", idxs[0])
-            print("obj_pos.shape:", obj_pos.shape)
-            print("obj_pos[0]:", obj_pos[0])
+            # gather pair-wise relations according to min_dist_idxs
+            pairs = []
+            obj_idxs = torch.arange(0, self.num_objects).unsqueeze(
+                0).repeat(num_envs, 1).to(min_dist_idxs.device)
+            for r in range(self.num_relations):
+                pairs.append(torch.stack([obj_idxs, min_dist_idxs[..., r]],
+                                         dim=-1))
+            pairs = torch.stack(pairs, dim=-1).transpose(
+                2, 3)  # (num_envs, num_objects, num_relations, 2)
+            gather_idxs = pairs.unsqueeze(-1).repeat(
+                1, 1, 1, 1, token_size).view(
+                obj_pos.shape[0], self.num_objects, self.num_relations, -1
+            )  # (num_envs, num_objects, num_relations, 2 * token_size)
+            gather_idxs = gather_idxs.view(
+                obj_pos.shape[0], -1, 2 * token_size
+            )  # (num_envs, num_objects * num_relations, 2 * token_size)
+            o_pair = torch.gather(
+                obj_tokens.repeat(1, 1, 2), 1, gather_idxs)
 
-            print("idxs.shape:", idxs.shape)
-            first_idxs = idxs[..., 0].unsqueeze(-1).repeat(1, 1, obj_pos.shape[2])
-            second_idxs = idxs[..., 1].unsqueeze(-1).repeat(1, 1, obj_pos.shape[2])
-
-            print("first_idxs.shape:", first_idxs.shape)
-            print("first_idxs:", first_idxs)
-            print("second_idxs:", second_idxs)
-
-            first_obj = torch.gather(obj_pos, 1, first_idxs)
-            second_obj = torch.gather(obj_pos, 2, second_idxs)
-
-            obj_pairs = torch.stack([first_obj, second_obj], dim=-1)
-
-            print("obj_pairs.shape:", obj_pairs.shape)
-            print("obj_pairs[0]:", obj_pairs[0])
-
-            import time
-            time.sleep(1000)
-
-
-
-
-            obj_tokens = self.emb_mlp(
-                obj_set)  # (num_envs, num_obj, token_size)
-
-
-            o_i = obj_tokens.unsqueeze(1).repeat(1, self.num_objects, 1,
-                                                 1)  # (num_envs, num_obj, num_obj, token_size)
-            o_j = obj_tokens.unsqueeze(2).repeat(1, 1, self.num_objects,
-                                                 1)  # (num_envs, num_obj, num_obj, token_size)
-            o_pair = torch.cat([o_i, o_j], dim=-1)
-            o_pair = o_pair.view(obj_set.shape[0], self.num_objects ** 2,
-                                 -1)  # (num_envs, num_obj ** 2, 2 * token_size)
             relations = self.rel_mlp(o_pair)
             out = relations.sum(1)  # (num_envs, emb_size)
 
