@@ -565,6 +565,13 @@ class RelationalA2CBuilder(NetworkBuilder):
                 obj_emb_input_shape = params['arn']['rel_mlp']['units'][-1]
                 mlp_input_shape = robot_input_shape + obj_emb_input_shape
 
+            if self.has_pio:
+                self._build_pio(params['pio'])
+                robot_input_shape = mlp_input_shape - self.num_objects * \
+                                    self.object_state_size
+                obj_emb_input_shape = params['pio']['emb_mlp']['units'][-1]
+                mlp_input_shape = robot_input_shape + obj_emb_input_shape
+
             if self.has_rrn:
                 self._build_rrn(params)
                 robot_input_shape = mlp_input_shape - self.num_objects * \
@@ -770,6 +777,27 @@ class RelationalA2CBuilder(NetworkBuilder):
                 out = self.actor_cnn(out)
                 out = out.flatten(1)
 
+                if self.has_pio:
+                    obj_set, robot_obs = self.split_set_obs(obs)
+                    if self.verbose:
+                        print("forward with PIO called ...")
+                        print("obj_set.shape:", obj_set.shape)
+                        print("robot_obs.shape:", robot_obs.shape)
+                        print("robot_obs[0]:", robot_obs[0])
+                        print("self.observation:", self.observations)
+                        print("self.obs_size:", self.obs_size)
+
+                        idx = 0
+                        for obs_type in self.observations:
+                            if obs_type.startswith('object'):
+                                for o in range(self.num_objects):
+                                    print(obs_type, f"(object {o}):",
+                                          obj_set[0, o, idx:idx+self.obs_size[obs_type]])
+                                idx += self.obs_size[obs_type]
+
+                    obj_emb = self.get_pio_emb(obj_set)
+                    out = torch.cat([obj_emb, robot_obs], dim=1)
+
                 if self.has_rn:
                     obj_set, robot_obs = self.split_set_obs(obs)
                     if self.verbose:
@@ -890,6 +918,16 @@ class RelationalA2CBuilder(NetworkBuilder):
             obj_set = obj_set.view(obs.shape[0], self.num_objects,
                                    self.object_state_size)
             return obj_set, robot_obs
+
+        def get_pio_emb(self, obj_set):
+            obj_tokens = self.emb_mlp(
+                obj_set)  # (num_envs, num_obj, token_size)
+            out = obj_tokens.sum(1)  # (num_envs, token_size)
+
+            if self.verbose:
+                print("obj_tokens.shape:", obj_tokens.shape)
+                print("out.shape:", out.shape)
+            return self.pio_layer_norm(out)
 
         def get_rn_emb(self, obj_set):
             obj_tokens = self.emb_mlp(
@@ -1014,8 +1052,9 @@ class RelationalA2CBuilder(NetworkBuilder):
             self.has_rn = 'rn' in params and 'rn' in params['active']
             self.has_arn = 'arn' in params and 'arn' in params['active']
             self.has_rrn = 'rrn' in params and 'rrn' in params['active']
+            self.has_pio = 'pio' in params and 'pio' in params['active']
             assert (int(self.has_rn) + int(self.has_arn) +
-                    int(self.has_rrn)) <= 1, \
+                    int(self.has_rrn) + int(self.has_pio)) <= 1, \
                 "Only one relational architecture can be used at a time."
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
@@ -1045,6 +1084,13 @@ class RelationalA2CBuilder(NetworkBuilder):
                 self.rnn_ln = params['rnn'].get('layer_norm', False)
                 self.is_rnn_before_mlp = params['rnn'].get('before_mlp', False)
                 self.rnn_concat_input = params['rnn'].get('concat_input', False)
+
+            if self.has_pio:
+                self.object_state_size = self._infer_object_state_size(
+                    params['pio'])
+                self.num_objects = params['pio']['num_objects']
+                self.observations = params['pio']['observations']
+                self.obs_size = params['pio']['obs_size']
 
             if self.has_rn:
                 self.object_state_size = self._infer_object_state_size(
@@ -1115,6 +1161,25 @@ class RelationalA2CBuilder(NetworkBuilder):
                 print("Building Relational Network module ...")
                 print("emb_mlp:", self.emb_mlp)
                 print("rel_mlp:", self.rel_mlp)
+
+        def _build_pio(self, pio_params):
+            emb_mlp_args = {
+                'input_size': self.object_state_size,
+                'units': pio_params['emb_mlp']['units'],
+                'activation': pio_params['emb_mlp']['activation'],
+                'norm_func_name': self.normalization,
+                'dense_func': torch.nn.Linear,
+                'd2rl': False,
+                'norm_only_first_layer': self.norm_only_first_layer
+            }
+            self.emb_mlp = self._build_mlp(**emb_mlp_args)
+
+            if pio_params['layer_norm']:
+                self.pio_layer_norm = nn.LayerNorm(
+                    pio_params['emb_mlp']['units'][-1])
+            else:
+                self.pio_layer_norm = nn.Identity
+
 
         def _build_rrn(self, params):
             # h0_i = e(x_i)
