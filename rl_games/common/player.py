@@ -8,6 +8,7 @@ from rl_games.algos_torch import  model_builder
 class BasePlayer(object):
     def __init__(self, params):
         self.config = config = params['config']
+        self.network_config = params['network']
         self.load_networks(params)
         self.env_name = self.config['env_name']
         self.env_config = self.config.get('env_config', {})
@@ -254,6 +255,238 @@ class BasePlayer(object):
             print('av reward:', sum_rewards / games_played * n_game_life,
                   'av steps:', sum_steps / games_played * n_game_life)
 
+    def teach(self):
+        print('BasePlayer.teach() called ...')
+        from rl_games.algos_torch.students import Impala2D
+
+        joint_pos_start_idx = self.infer_joint_angle_start_idx()
+
+        n_games = self.games_num
+        render = self.render_env
+        n_game_life = self.n_game_life
+        is_determenistic = self.is_determenistic
+        sum_rewards = 0
+        sum_steps = 0
+        sum_game_res = 0
+        n_games = n_games * n_game_life
+        games_played = 0
+        has_masks = False
+        has_masks_func = getattr(self.env, "has_action_mask", None) is not None
+
+        op_agent = getattr(self.env, "create_agent", None)
+        if op_agent:
+            agent_inited = True
+            # print('setting agent weights for selfplay')
+            # self.env.create_agent(self.env.config)
+            # self.env.set_weights(range(8),self.get_weights())
+
+        if has_masks_func:
+            has_masks = self.env.has_action_mask()
+
+        need_init_rnn = self.is_rnn
+        for _ in range(n_games):
+            if games_played >= n_games:
+                break
+
+            #obses = self.env_reset(self.env)
+            obses = self.env.reset()
+
+            batch_size = 1
+            batch_size = self.get_batch_size(obses['obs'], batch_size)
+            num_channels = self.get_num_channels(obses['image'])
+            image_size = obses['image'].shape[2]
+            action_size = 11
+            state_size = 17
+            student = Impala2D(num_channels, 32, image_size, state_size, action_size).to(obses['obs'].device)
+
+            if need_init_rnn:
+                self.init_rnn()
+                need_init_rnn = False
+
+            cr = torch.zeros(batch_size, dtype=torch.float32, device=obses['obs'].device)
+            steps = torch.zeros(batch_size, dtype=torch.float32, device=obses['obs'].device)
+
+            print_game_res = False
+
+            while True:
+                rollout_steps = 32
+                observations = {'images': [], 'joint_pos': [], 'obs': []}
+                student_actions, expert_actions = [], []
+                for s in range(rollout_steps):
+                    print('rollout_step:', s)
+
+                    # process obs dict
+                    images = torch.cat([obses['image'][:, cam] for cam in
+                                        range(obses['image'].shape[1])],
+                                       dim=-1).permute(0, 3, 1, 2)
+                    joint_pos = obses['obs'][:,
+                                joint_pos_start_idx:joint_pos_start_idx + 17]
+
+                    # append observations to lists
+                    observations['obs'].append(obses['obs'])
+                    observations['images'].append(images)
+                    observations['joint_pos'].append(joint_pos)
+
+
+                    # get and append student actions
+                    student_act = student(images, joint_pos)
+                    student_actions.append(student_act)
+
+                    # get expert actions and append them
+                    expert_act = self.get_action(obses['obs'], is_determenistic)
+                    expert_actions.append(student_act)
+
+                    # step environment with student action
+                    obses, rew, done, info = self.env.step(student_act)
+                    cr += rew
+                    steps += 1
+
+                    if render:
+                        self.env.render(mode='human')
+                        time.sleep(self.render_sleep)
+
+                    all_done_indices = done.nonzero(as_tuple=False)
+                    done_indices = all_done_indices[::self.num_agents]
+                    done_count = len(done_indices)
+                    games_played += done_count
+
+                    if done_count > 0:
+                        if self.is_rnn:
+                            for s in self.states:
+                                s[:, all_done_indices, :] = s[:, all_done_indices,
+                                                            :] * 0.0
+
+                        cur_rewards = cr[done_indices].sum().item()
+                        cur_steps = steps[done_indices].sum().item()
+
+                        cr = cr * (1.0 - done.float())
+                        steps = steps * (1.0 - done.float())
+                        sum_rewards += cur_rewards
+                        sum_steps += cur_steps
+
+                        game_res = 0.0
+                        if isinstance(info, dict):
+                            if 'battle_won' in info:
+                                print_game_res = True
+                                game_res = info.get('battle_won', 0.5)
+                            if 'scores' in info:
+                                print_game_res = True
+                                game_res = info.get('scores', 0.5)
+
+                        if self.print_stats:
+                            if print_game_res:
+                                print('reward:', cur_rewards / done_count,
+                                      'steps:', cur_steps / done_count, 'w:',
+                                      game_res)
+                            else:
+                                print('reward:', cur_rewards / done_count,
+                                      'steps:', cur_steps / done_count)
+
+                        sum_game_res += game_res
+                        if batch_size // self.num_agents == 1 or games_played >= n_games:
+                            break
+
+                # After taking 32 rollout steps
+                print("finished taking rollout steps")
+                # stack all observations and actions
+                observations['obs'] = torch.cat(observations['obs'])
+                observations['images'] = torch.cat(observations['images'])
+                observations['joint_pos'] = torch.cat(observations['joint_pos'])
+                student_actions = torch.cat(student_actions)
+                expert_actions = torch.cat(expert_actions)
+
+                training_size = observations['obs'].shape[0]
+
+                print("training_size:"), training_size
+
+
+                print("observations['obs'].shape:", observations['obs'].shape)
+                print("observations['images'].shape:", observations['images'].shape)
+                print("observations['joint_pos'].shape:", observations['joint_pos'].shape)
+
+                print("student_actions.shape:", student_actions.shape)
+                print("expert_actions.shape:", expert_actions.shape)
+
+
+                import time
+                time.sleep(1000)
+
+
+
+
+
+
+
+
+
+
+
+            for n in range(self.max_steps):
+                if has_masks:
+                    masks = self.env.get_action_mask()
+                    action = self.get_masked_action(
+                        obses, masks, is_determenistic)
+                else:
+                    action = self.get_action(obses, is_determenistic)
+                obses, r, done, info = self.env_step(self.env, action)
+                cr += r
+                steps += 1
+
+                if render:
+                    self.env.render(mode='human')
+                    time.sleep(self.render_sleep)
+
+                all_done_indices = done.nonzero(as_tuple=False)
+                done_indices = all_done_indices[::self.num_agents]
+                done_count = len(done_indices)
+                games_played += done_count
+
+                if done_count > 0:
+                    if self.is_rnn:
+                        for s in self.states:
+                            s[:, all_done_indices, :] = s[:, all_done_indices,
+                                                        :] * 0.0
+
+                    cur_rewards = cr[done_indices].sum().item()
+                    cur_steps = steps[done_indices].sum().item()
+
+                    cr = cr * (1.0 - done.float())
+                    steps = steps * (1.0 - done.float())
+                    sum_rewards += cur_rewards
+                    sum_steps += cur_steps
+
+                    game_res = 0.0
+                    if isinstance(info, dict):
+                        if 'battle_won' in info:
+                            print_game_res = True
+                            game_res = info.get('battle_won', 0.5)
+                        if 'scores' in info:
+                            print_game_res = True
+                            game_res = info.get('scores', 0.5)
+
+                    if self.print_stats:
+                        if print_game_res:
+                            print('reward:', cur_rewards / done_count,
+                                  'steps:', cur_steps / done_count, 'w:',
+                                  game_res)
+                        else:
+                            print('reward:', cur_rewards / done_count,
+                                  'steps:', cur_steps / done_count)
+
+                    sum_game_res += game_res
+                    if batch_size // self.num_agents == 1 or games_played >= n_games:
+                        break
+
+        print(sum_rewards)
+        if print_game_res:
+            print('av reward:', sum_rewards / games_played * n_game_life,
+                  'av steps:', sum_steps /
+                  games_played * n_game_life, 'winrate:',
+                  sum_game_res / games_played * n_game_life)
+        else:
+            print('av reward:', sum_rewards / games_played * n_game_life,
+                  'av steps:', sum_steps / games_played * n_game_life)
+
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape
         if type(self.obs_shape) is dict:
@@ -272,3 +505,27 @@ class BasePlayer(object):
         self.batch_size = batch_size
 
         return batch_size
+
+    def get_num_channels(self, image_obses) -> int:
+        _, num_cameras, _, _, num_channels = image_obses.shape
+        return num_cameras * num_channels
+
+    def infer_joint_angle_start_idx(self) -> int:
+        # get object state size
+        object_state_size = 0
+        for obs in self.network_config['rn']['observations']:
+            if obs.startswith('object'):
+                object_state_size += self.network_config['rn']['obs_size'][obs]
+
+        joint_angle_start_index = object_state_size * self.network_config['rn']['num_objects']
+
+        for obs in self.network_config['rn']['observations']:
+            if not obs.startswith('object'):
+                if obs == 'jointPos':
+                    break
+                else:
+                    joint_angle_start_index += self.network_config['rn']['obs_size'][obs]
+        print("joint_angle_start_index:", joint_angle_start_index)
+
+        return joint_angle_start_index
+

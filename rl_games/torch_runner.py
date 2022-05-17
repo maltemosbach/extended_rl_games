@@ -95,6 +95,16 @@ class Runner:
         _override_sigma(player, args)
         player.run()
 
+    def run_dagger(self, args):
+        print('Started running DAgger imitation learning')
+        teacher = self.create_player()
+        _restore(teacher, args)
+        _override_sigma(teacher, args)
+        print("teacher:", teacher)
+        teacher.teach()
+        import time
+        time.sleep(1000)
+
     def create_player(self):
         return self.player_factory.create(self.algo_name, params=self.params)
 
@@ -103,10 +113,10 @@ class Runner:
 
     def run(self, args):
         load_path = None
-
-        if args['train']:
+        if args['imitate']:
+            self.run_dagger(args)
+        elif args['train']:
             self.run_train(args)
-
         elif args['play']:
             self.run_play(args)
         else:

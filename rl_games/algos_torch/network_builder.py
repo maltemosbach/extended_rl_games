@@ -1011,14 +1011,12 @@ class RelationalA2CBuilder(NetworkBuilder):
             self.normalization = params.get('normalization', None)
             self.has_rnn = 'rnn' in params and not params['rnn'].get(
                 'disable', False)
-            self.has_rn = 'rn' in params and not params['rn'].get(
-                'disable', False)
-            self.has_arn = 'arn' in params and not params['arn'].get(
-                'disable', False)
-            self.has_rrn = 'rrn' in params and not params['rrn'].get(
-                'disable', False)
-            assert not (self.has_rn and self.has_rrn), \
-                "RN and RRN can not be used at once."
+            self.has_rn = 'rn' in params and 'rn' in params['active']
+            self.has_arn = 'arn' in params and 'arn' in params['active']
+            self.has_rrn = 'rrn' in params and 'rrn' in params['active']
+            assert (int(self.has_rn) + int(self.has_arn) +
+                    int(self.has_rrn)) <= 1, \
+                "Only one relational architecture can be used at a time."
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
             self.joint_obs_actions_config = params.get('joint_obs_actions',
