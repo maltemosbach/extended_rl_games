@@ -559,7 +559,8 @@ class RelationalA2CBuilder(NetworkBuilder):
 
             if self.has_arn:
                 self._build_rn(params['arn'])
-                self.num_relations = params['arn']['num_relations']
+                self.num_relations = min(params['arn']['num_relations'],
+                                         self.num_objects - 1)
                 robot_input_shape = mlp_input_shape - self.num_objects * \
                                     self.object_state_size
                 obj_emb_input_shape = params['arn']['rel_mlp']['units'][-1]
