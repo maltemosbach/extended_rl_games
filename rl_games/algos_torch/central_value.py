@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.distributed as dist
 import gym
 import numpy as np
 from rl_games.algos_torch import torch_ext
@@ -9,7 +10,7 @@ from rl_games.common import datasets
 from rl_games.common import schedulers
 
 class CentralValueTrain(nn.Module):
-    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, seq_len, normalize_value,network, config, writter, max_epochs, multi_gpu, hvd):
+    def __init__(self, state_shape, value_size, ppo_device, num_agents, horizon_length, num_actors, num_actions, seq_len, normalize_value,network, config, writter, max_epochs, multi_gpu):
         nn.Module.__init__(self)
         self.ppo_device = ppo_device
         self.num_agents, self.horizon_length, self.num_actors, self.seq_len = num_agents, horizon_length, num_actors, seq_len
@@ -19,7 +20,6 @@ class CentralValueTrain(nn.Module):
         self.value_size = value_size
         self.max_epochs = max_epochs
         self.multi_gpu = multi_gpu
-        self.hvd = hvd
         self.truncate_grads = config.get('truncate_grads', False)
         self.config = config
         self.normalize_input = config['normalize_input']
@@ -45,8 +45,10 @@ class CentralValueTrain(nn.Module):
             self.scheduler = schedulers.IdentityScheduler()
         
         self.mini_epoch = config['mini_epochs']
-        self.mini_batch = config['minibatch_size']
-        self.num_minibatches = self.horizon_length * self.num_actors // self.mini_batch
+        assert(('minibatch_size_per_env' in self.config) or ('minibatch_size' in self.config))
+        self.minibatch_size_per_env = self.config.get('minibatch_size_per_env', 0)
+        self.minibatch_size = self.config.get('minibatch_size', self.num_actors * self.minibatch_size_per_env)
+        self.num_minibatches = self.horizon_length * self.num_actors // self.minibatch_size
         self.clip_value = config['clip_value']
 
         self.writter = writter
@@ -71,12 +73,12 @@ class CentralValueTrain(nn.Module):
             assert ((self.horizon_length * total_agents // self.num_minibatches) % self.seq_len == 0)
             self.mb_rnn_states = [ torch.zeros((num_seqs, s.size()[0], total_agents, s.size()[2]), dtype=torch.float32, device=self.ppo_device) for s in self.rnn_states]
 
-        self.dataset = datasets.PPODataset(self.batch_size, self.mini_batch, True, self.is_rnn, self.ppo_device, self.seq_len)
+        self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, True, self.is_rnn, self.ppo_device, self.seq_len)
 
     def update_lr(self, lr):
         if self.multi_gpu:
-            lr_tensor = torch.tensor([lr])
-            self.hvd.broadcast_value(lr_tensor, 'cv_learning_rate')
+            lr_tensor = torch.tensor([lr], device=self.device)
+            dist.broadcast(lr_tensor, 0)
             lr = lr_tensor.item()
 
         for param_group in self.optimizer.param_groups:
@@ -121,7 +123,8 @@ class CentralValueTrain(nn.Module):
         self.dataset.update_values_dict(batch_dict)
 
     def _preproc_obs(self, obs_batch):
-        if isinstance(obs_batch, dict):
+        if type(obs_batch) is dict:
+            obs_batch = copy.copy(obs_batch)
             for k,v in obs_batch.items():
                 if v.dtype == torch.uint8:
                     obs_batch[k] = v.float() / 255.0

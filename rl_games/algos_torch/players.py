@@ -26,6 +26,7 @@ class PpoPlayerContinuous(BasePlayer):
 
         self.normalize_input = self.config['normalize_input']
         self.normalize_value = self.config.get('normalize_value', False)
+
         obs_shape = self.obs_shape
         config = {
             'actions_num' : self.actions_num,
@@ -140,6 +141,7 @@ class PpoPlayerDiscrete(BasePlayer):
         if self.has_batch_dimension == False:
             obs = unsqueeze_obs(obs)
         obs = self._preproc_obs(obs)
+
         self.model.eval()
         input_dict = {
             'is_train': False,

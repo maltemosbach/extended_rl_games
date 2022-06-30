@@ -10,15 +10,21 @@ class Envpool(IVecEnv):
         self.batch_size = num_actors
         env_name=kwargs.pop('env_name')
         self.has_lives = kwargs.pop('has_lives', False)
+        self.use_dict_obs_space = kwargs.pop('use_dict_obs_space', False)
         self.env = envpool.make( env_name,
                                  env_type=kwargs.pop('env_type', 'gym'),
                                  num_envs=num_actors,
                                  batch_size=self.batch_size,
-                                 episodic_life=kwargs.pop('episodic_life', True),
-                                 reward_clip=kwargs.pop('reward_clip', False) # thread_affinity=False,
+                                 **kwargs
                                 )
-
-        self.observation_space = self.env.observation_space
+        if self.use_dict_obs_space:
+            self.observation_space= gym.spaces.Dict({
+                'observation' : self.env.observation_space,
+                'reward' : gym.spaces.Box(low=0, high=1, shape=( ), dtype=np.float32),
+                'last_action': gym.spaces.Box(low=0, high=self.env.action_space.n, shape=(), dtype=np.long)
+            })
+        else:
+            self.observation_space = self.env.observation_space
         self.ids = np.arange(0, num_actors)
         self.action_space = self.env.action_space
         self.scores = np.zeros(num_actors)
@@ -26,6 +32,8 @@ class Envpool(IVecEnv):
 
     def _set_scores(self, infos, dones):
         # thanks to cleanrl: https://github.com/vwxyzjn/cleanrl/blob/3d20d11f45a5f1d764934e9851b816d0b03d2d10/cleanrl/ppo_atari_envpool.py#L111
+        if 'reward' not in infos:
+            return
         self.scores += infos["reward"]
         self.returned_scores[:] = self.scores
         infos["scores"] = self.returned_scores
@@ -43,10 +51,22 @@ class Envpool(IVecEnv):
         next_obs, reward, is_done, info = self.env.step(action , self.ids)
         info['time_outs'] = info['TimeLimit.truncated']
         self._set_scores(info, is_done)
+        if self.use_dict_obs_space:
+            next_obs = {
+                'observation': next_obs,
+                'reward': np.clip(reward, -1, 1),
+                'last_action': action
+            }
         return next_obs, reward, is_done, info
 
     def reset(self):
         obs = self.env.reset(self.ids)
+        if self.use_dict_obs_space:
+            obs = {
+                'observation': obs,
+                'reward': np.zeros(obs.shape[0]),
+                'last_action': np.zeros(obs.shape[0]),
+            }
         return obs
 
     def get_number_of_agents(self):
