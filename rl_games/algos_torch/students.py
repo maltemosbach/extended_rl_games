@@ -4,6 +4,25 @@ from torch import Tensor
 import torch.nn as nn
 
 
+class MLPStudent(nn.Module):
+    def __init__(self, state_size: int, action_size: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(state_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_size)
+        )
+
+    def forward(self, state):
+        action = self.mlp(state)
+        action = torch.clamp(action, -1, 1)
+        return action
+
+
 class Impala2D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, image_size: int,
                  state_size: int, action_size: int, activation: str = 'elu',
@@ -21,8 +40,6 @@ class Impala2D(nn.Module):
                                         use_zero_init=use_zero_init)
 
         image_mlp_in = int(out_channels * ((image_size / 2) ** 2))
-        print("image_mlp_in:", image_mlp_in)
-
         self.image_mlp = nn.Sequential(
             nn.Linear(image_mlp_in, 512),
             nn.ReLU(),
@@ -43,7 +60,6 @@ class Impala2D(nn.Module):
             nn.Linear(256, action_size)
         )
 
-
     def image_forward(self, image) -> Tensor:
         emb = self.conv(image)
         emb = self.max_pool(emb)
@@ -57,14 +73,11 @@ class Impala2D(nn.Module):
         return emb
 
     def forward(self, image, state):
-        print('image.shape:', image.shape)
         image_emb = self.image_forward(image)
-        print("image_embedding.shape:", image_emb.shape)
         state_emb = self.state_forward(state)
-
         emb = torch.cat([image_emb, state_emb], dim=-1)
-
         action = self.head(emb)
         return action
+
 
 

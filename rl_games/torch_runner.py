@@ -113,7 +113,7 @@ class Runner:
 
     def run(self, args):
         load_path = None
-        if args['imitate']:
+        if args.get('imitate', False):
             self.run_dagger(args)
         elif args['train']:
             self.run_train(args)
