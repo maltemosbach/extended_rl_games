@@ -26,40 +26,96 @@ class DAPGAgent(A2CAgent):
 
         self.demo_cfg = params['config']['demo']
         self.demo_cfg['dataset']['goal_mode'] = None
-        self.demo_cfg['dataset']['filter_by_attribute'] = None
         self.ppo_coef = params['config']['ppo_coef']
         self.bc_coef_const = params['config']['bc_coef_const']
         self.bc_coef_decay = params['config']['bc_coef_decay']
         self.l1_loss_weight = params['config']['l1_loss_weight']
         self.l2_loss_weight = params['config']['l2_loss_weight']
-        self.load_demo_dataset()
+        self.load_demo_data()
         self.current_epoch = 0
 
     @property
     def bc_coef(self) -> float:
         return self.bc_coef_const * (self.bc_coef_decay ** self.current_epoch)
 
-    def load_demo_dataset(self) -> None:
-        demo_dataset = SequenceDataset(**self.demo_cfg['dataset'])
+    def load_demo_data(self) -> None:
+        train_dataset = SequenceDataset(**self.demo_cfg['dataset'],
+                                        filter_by_attribute='train')
+        valid_dataset = SequenceDataset(**self.demo_cfg['dataset'],
+                                        filter_by_attribute='valid')
 
-        demo_sampler = demo_dataset.get_dataset_sampler()
-        self.demo_dataloader = DataLoader(
-            dataset=demo_dataset,
-            sampler=demo_sampler,
+        train_sampler = train_dataset.get_dataset_sampler()
+        valid_sampler = valid_dataset.get_dataset_sampler()
+
+        self.demo_train_loader = DataLoader(
+            dataset=train_dataset,
+            sampler=train_sampler,
             batch_size=self.demo_cfg['dataloader']['batch_size'],
-            shuffle=(demo_sampler is None),
+            shuffle=(train_sampler is None),
             num_workers=self.demo_cfg['dataloader']['num_workers'],
             drop_last=True
         )
-        self.demo_data_iter = iter(self.demo_dataloader)
+        self.demo_valid_loader = DataLoader(
+            dataset=valid_dataset,
+            sampler=valid_sampler,
+            batch_size=self.demo_cfg['dataloader']['batch_size'],
+            shuffle=(valid_sampler is None),
+            num_workers=self.demo_cfg['dataloader']['num_workers'],
+            drop_last=True
+        )
 
-    def get_demo_dict(self) -> Dict[str, Any]:
+        self.demo_train_iter = iter(self.demo_train_loader)
+        self.demo_valid_iter = iter(self.demo_valid_loader)
+
+    def sample_demo_dict(self, valid: bool = False) -> Dict[str, Any]:
+        demo_iter = self.demo_valid_iter if valid else self.demo_train_iter
         try:
-            demo_dict = next(self.demo_data_iter)
+            demo_dict = next(demo_iter)
         except StopIteration:
-            self.demo_data_iter = iter(self.demo_dataloader)
-            demo_dict = next(self.demo_data_iter)
+            if valid:
+                self.demo_valid_iter = iter(self.demo_valid_loader)
+                demo_dict = next(self.demo_valid_iter)
+            else:
+                self.demo_train_iter = iter(self.demo_train_loader)
+                demo_dict = next(self.demo_train_iter)
         return demo_dict
+
+    def sample_demo_train_valid(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        # demo train data
+        demo_train_dict = self.sample_demo_dict()
+        train_obs = self._preproc_obs(demo_train_dict['obs']['obs'])[:, 0]
+        train_actions = demo_train_dict['actions'][:, 0]
+        demo_train_dict = dict_to_device({
+            'is_train': True,
+            'prev_actions': train_actions,
+            'obs': train_obs,
+        }, device=self.ppo_device)
+
+        # demo valid data
+        demo_valid_dict = self.sample_demo_dict(valid=True)
+        valid_obs = self._preproc_obs(demo_valid_dict['obs']['obs'])[:, 0]
+        valid_actions = demo_valid_dict['actions'][:, 0]
+        demo_valid_dict = dict_to_device({
+            'is_train': False,
+            'prev_actions': valid_actions,
+            'obs': valid_obs,
+        }, device=self.ppo_device)
+        return demo_train_dict, demo_valid_dict
+
+    def get_demo_actions(self, demo_train_dict: Dict[str, Any],
+                         demo_valid_dict: Dict[str, Any] = None
+                         ) -> Tuple[torch.Tensor, torch.Tensor]:
+        demo_train_res_dict = self.model(demo_train_dict)
+        train_mu = demo_train_res_dict['mus']
+        train_sigma = demo_train_res_dict['sigmas']
+
+        if demo_valid_dict:
+            with torch.no_grad():
+                demo_valid_res_dict = self.model(demo_valid_dict)
+                valid_mu = demo_valid_res_dict['mus']
+                valid_sigma = demo_valid_res_dict['sigmas']
+            return train_mu, valid_mu
+        return train_mu
 
     def bc_loss(self, actions: torch.Tensor,
                 target_actions: torch.Tensor) -> torch.Tensor:
@@ -81,11 +137,6 @@ class DAPGAgent(A2CAgent):
         obs_batch = input_dict['obs']
         obs_batch = self._preproc_obs(obs_batch)
 
-        # demonstration data
-        demo_dict = self.get_demo_dict()
-        demo_obs_batch = self._preproc_obs(demo_dict['obs']['obs'])[:, 0]
-        demo_actions_batch = demo_dict['actions'][:, 0]
-
         lr_mul = 1.0
         curr_e_clip = self.e_clip
 
@@ -95,11 +146,8 @@ class DAPGAgent(A2CAgent):
             'obs': obs_batch,
         }
 
-        demo_batch_dict = dict_to_device({
-            'is_train': True,
-            'prev_actions': demo_actions_batch,
-            'obs': demo_obs_batch,
-        }, device=self.ppo_device)
+        # sample demonstration data
+        demo_train_dict, demo_valid_dict = self.sample_demo_train_valid()
 
         rnn_masks = None
         if self.is_rnn:
@@ -142,14 +190,16 @@ class DAPGAgent(A2CAgent):
             ppo_loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
 
             # Imitation loss
-            demo_res_dict = self.model(demo_batch_dict)
-            demo_mu = demo_res_dict['mus']
-            demo_sigma = demo_res_dict['sigmas']
+            demo_train_actions, demo_valid_actions = self.get_demo_actions(
+                demo_train_dict, demo_valid_dict)
 
-            bc_loss = self.bc_loss(demo_mu, demo_batch_dict['prev_actions'])
+            bc_train_loss = self.bc_loss(demo_train_actions,
+                                         demo_train_dict['prev_actions'])
+            bc_valid_loss = self.bc_loss(demo_valid_actions,
+                                         demo_valid_dict['prev_actions'])
 
             # Sum up bc and ppo loss
-            loss = self.ppo_coef * ppo_loss + self.bc_coef * bc_loss
+            loss = self.ppo_coef * ppo_loss + self.bc_coef * bc_train_loss
 
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -181,7 +231,8 @@ class DAPGAgent(A2CAgent):
 
         self.train_result = (a_loss, c_loss, entropy, \
                              kl_dist, self.last_lr, lr_mul, \
-                             mu.detach(), sigma.detach(), b_loss, bc_loss)
+                             mu.detach(), sigma.detach(), b_loss,
+                             bc_train_loss, bc_valid_loss)
 
     def train(self):
         self.init_tensors()
@@ -201,7 +252,7 @@ class DAPGAgent(A2CAgent):
         while True:
             epoch_num = self.update_epoch()
             self.current_epoch = epoch_num
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, bc_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, bc_train_losses, bc_valid_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -231,7 +282,8 @@ class DAPGAgent(A2CAgent):
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
 
-                self.writer.add_scalar('losses/bc_loss', torch_ext.mean_list(bc_losses).item(), frame)
+                self.writer.add_scalar('losses/bc_train_loss', torch_ext.mean_list(bc_train_losses).item(), frame)
+                self.writer.add_scalar('losses/bc_valid_loss', torch_ext.mean_list(bc_valid_losses).item(), frame)
                 self.writer.add_scalar('info/bc_coef', self.bc_coef, frame)
 
                 if self.game_rewards.current_size > 0:
@@ -314,17 +366,19 @@ class DAPGAgent(A2CAgent):
         a_losses = []
         c_losses = []
         b_losses = []
-        bc_losses = []
+        bc_train_losses = []
+        bc_valid_losses = []
         entropies = []
         kls = []
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, bc_loss = self.train_actor_critic(self.dataset[i])
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss, bc_train_loss, bc_valid_loss = self.train_actor_critic(self.dataset[i])
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
-                bc_losses.append(bc_loss)
+                bc_train_losses.append(bc_train_loss)
+                bc_valid_losses.append(bc_valid_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
@@ -357,4 +411,4 @@ class DAPGAgent(A2CAgent):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, bc_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, bc_train_losses, bc_valid_losses, entropies, kls, last_lr, lr_mul
