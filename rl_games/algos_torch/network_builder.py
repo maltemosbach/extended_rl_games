@@ -550,9 +550,9 @@ class A2CPointNetBuilder(NetworkBuilder):
             mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
 
             if self.has_pointnet:
-                self._build_pointnet(params['pointnet'])
-                remaining_obs_shape = mlp_input_shape - params['pointnet']['obs_size']['objectPointCloud']
-                point_cloud_emb_shape = params['pointnet']['units'][-1]
+                self._build_pointnet(params)
+                remaining_obs_shape = mlp_input_shape - params['obs']['size']['objectPointCloud']
+                point_cloud_emb_shape = self.pointnet_units[-1]
                 mlp_input_shape = remaining_obs_shape + point_cloud_emb_shape
 
             in_mlp_shape = mlp_input_shape
@@ -863,7 +863,7 @@ class A2CPointNetBuilder(NetworkBuilder):
             self.value_activation = params.get('value_activation', 'None')
             self.normalization = params.get('normalization', None)
             self.has_rnn = 'rnn' in params
-            self.has_pointnet = 'pointnet' in params
+            self.has_pointnet = 'objectPointCloud' in params['obs']['type']
             self.has_space = 'space' in params
             self.central_value = params.get('central_value', False)
             self.joint_obs_actions_config = params.get('joint_obs_actions',
@@ -894,9 +894,9 @@ class A2CPointNetBuilder(NetworkBuilder):
                 self.rnn_concat_input = params['rnn'].get('concat_input', False)
 
             if self.has_pointnet:
-                self.pc_start_idx, self.pc_end_idx = self._infer_point_cloud_idx(params['pointnet'])
-                self.num_points = self._infer_num_points(params['pointnet'])
-                self.debug_pointnet = 'debug' in params['pointnet'] and params['pointnet']['debug']
+                self.pc_start_idx, self.pc_end_idx = self._infer_point_cloud_idx(params['obs'])
+                self.num_points = self._infer_num_points(params['obs'])
+                self.debug_pointnet = False
 
             if 'cnn' in params:
                 self.has_cnn = True
@@ -906,18 +906,18 @@ class A2CPointNetBuilder(NetworkBuilder):
                 self.has_cnn = False
 
         def _infer_point_cloud_idx(self, params):
-            assert 'objectPointCloud' in params['observations']
+            assert 'objectPointCloud' in params['type']
             start_idx, tmp = 0, 0
-            for obs in params['observations']:
+            for obs in params['type']:
                 if obs.startswith('object') and obs != 'objectPointCloud':
-                    tmp += params['obs_size'][obs]
+                    tmp += params['size'][obs]
                 if obs == 'objectPointCloud':
                     start_idx = tmp
-            end_idx = start_idx + params['obs_size']['objectPointCloud']
+            end_idx = start_idx + params['size']['objectPointCloud']
             return start_idx, end_idx
 
         def _infer_num_points(self, params) -> int:
-            num_points = params['obs_size']['objectPointCloud'] // 3
+            num_points = params['size']['objectPointCloud'] // 3
             return num_points
 
         def get_point_cloud_embedding(self, point_cloud):
@@ -926,13 +926,17 @@ class A2CPointNetBuilder(NetworkBuilder):
             return point_cloud_emb
 
         def _build_pointnet(self, params):
+            if 'pointnet' in params and 'units' in params['pointnet']:
+                self.pointnet_units = params['pointnet']['units']
+            else:
+                self.pointnet_units = [64, 128, 128]
             pointnet_modules = []
-            for l in range(len(params['units'])):
-                input_size = 3 if l == 0 else params['units'][l - 1]
-                output_size = params['units'][l]
+            for l in range(len(self.pointnet_units)):
+                input_size = 3 if l == 0 else self.pointnet_units[l - 1]
+                output_size = self.pointnet_units[l]
                 pointnet_modules.append(nn.Conv1d(input_size, output_size, 1))
                 pointnet_modules.append(nn.BatchNorm1d(output_size))
-                if l < len(params['units']) - 1:
+                if l < len(self.pointnet_units) - 1:
                     pointnet_modules.append(nn.ReLU())
             pointnet_modules.append(nn.MaxPool1d(self.num_points))
             self.pointnet = nn.Sequential(*tuple(pointnet_modules))
