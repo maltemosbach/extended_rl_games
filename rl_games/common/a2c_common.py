@@ -209,7 +209,7 @@ class A2CBase(BaseAlgorithm):
 
         # folders inside <train_dir>/<experiment_dir> for a specific purpose
         self.nn_dir = os.path.join(self.experiment_dir, 'nn')
-        self.summaries_dir = os.path.join(self.experiment_dir, 'summaries')
+        self.summaries_dir = os.path.join(self.experiment_dir, 'summaries/rl_games')
 
         os.makedirs(self.train_dir, exist_ok=True)
         os.makedirs(self.experiment_dir, exist_ok=True)
